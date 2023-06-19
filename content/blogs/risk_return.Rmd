@@ -78,7 +78,7 @@ table1 <- djia[[2]] %>% # the second table on the page contains the ticker symbo
          # if a stock is listed on NYSE, its symbol is, e.g., NYSE: MMM
          # We will get prices from yahoo finance which requires just the ticker
          
-         # if symbol contains "NYSE*", the * being a wildcard
+         # if symbol contains "NYSE*", the * being a wildcard 
          # then we jsut drop the first 6 characters in that string
          ticker = ifelse(str_detect(symbol, "NYSE*"),
                           str_sub(symbol,7,11),
