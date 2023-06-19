@@ -1,0 +1,587 @@
+---
+categories:  
+- ""    #the front matter should be like the one found in, e.g., blog2.md. It cannot be like the normal Rmd we used
+- ""
+date: "2021-09-30"
+description: Final Group Project # the title that will show up once someone gets to this page
+draft: false
+image: code.jpg # save picture in \static\img\blogs. Acceptable formats= jpg, jpeg, or png . Your iPhone pics wont work
+
+keywords: ""
+slug: final_group_project # slug is the shorthand URL address... no spaces plz
+title: Final Group Project
+---
+  
+---
+title: "Final Group project"
+author: "Notis Lapatas, Jesus Tuesta, Emma Dukhan, Abdulaziz Abi Haydar"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+  html_document:
+    theme: flatly
+    highlight: zenburn
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+    code_folding: show
+---
+
+
+```{r}
+#| label: load-libraries
+#| echo: false # This option disables the printing of code (only output is displayed).
+#| message: false
+#| warning: false
+rm(list=ls())
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(kknn)
+library(here)
+library(tictoc)
+library(vip)
+library(ranger)# Random Forest
+library(xgboost)# Boosted tree
+```
+
+# The problem: predicting credit card fraud
+
+The goal of the project is to predict fraudulent credit card transactions.
+
+We will be using a dataset with credit card transactions containing legitimate and fraud transactions. 
+## Obtain the data
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+card_fraud <- read_csv(here::here("data", "card_fraud.csv")) %>% 
+
+  mutate(
+    # in tidymodels, outcome should be a factor  
+    is_fraud = factor(is_fraud),
+    
+    # first level is the event in tidymodels, so we need to reorder
+    is_fraud = relevel(is_fraud, ref = "1")
+         )
+
+glimpse(card_fraud)
+```
+
+The data dictionary is as follows
+
+| column(variable)      | description                                 |
+|-----------------------|---------------------------------------------|
+| trans_date_trans_time | Transaction DateTime                        |
+| trans_year            | Transaction year                            |
+| category              | category of merchant                        |
+| amt                   | amount of transaction                       |
+| city                  | City of card holder                         |
+| state                 | State of card holder                        |
+| lat                   | Latitude location of purchase               |
+| long                  | Longitude location of purchase              |
+| city_pop              | card holder's city population               |
+| job                   | job of card holder                          |
+| dob                   | date of birth of card holder                |
+| merch_lat             | Latitude Location of Merchant               |
+| merch_long            | Longitude Location of Merchant              |
+| is_fraud              | Whether Transaction is Fraud (1) or Not (0) |
+
+
+```{r}
+card_fraud <- card_fraud %>% 
+  mutate( hour = hour(trans_date_trans_time),
+          wday = wday(trans_date_trans_time, label = TRUE),
+          month_name = month(trans_date_trans_time, label = TRUE),
+          age = interval(dob, trans_date_trans_time) / years(1)
+) %>% 
+  rename(year = trans_year) %>% 
+  
+  mutate(
+    
+    # convert latitude/longitude to radians
+    lat1_radians = lat / 57.29577951,
+    lat2_radians = merch_lat / 57.29577951,
+    long1_radians = long / 57.29577951,
+    long2_radians = merch_long / 57.29577951,
+    
+    # calculate distance in miles
+    distance_miles = 3963.0 * acos((sin(lat1_radians) * sin(lat2_radians)) + cos(lat1_radians) * cos(lat2_radians) * cos(long2_radians - long1_radians)),
+
+    # calculate distance in km
+    distance_km = 6377.830272 * acos((sin(lat1_radians) * sin(lat2_radians)) + cos(lat1_radians) * cos(lat2_radians) * cos(long2_radians - long1_radians))
+
+  )
+
+```
+
+## Exploratory Data Analysis (EDA) 
+
+We reuse the EDA from earlier
+
+-   Do we have excessive number of categories? Do we want to combine some?
+
+```{r}
+card_fraud %>% 
+  count(category, sort=TRUE)%>% 
+  mutate(perc = n/sum(n))
+
+card_fraud %>% 
+  count(job, sort=TRUE) %>% 
+  mutate(perc = n/sum(n))
+
+
+```
+No we don't have to combine (5% threshold). 
+We won't use the jobs variable because we have an excessive amount of jobs.
+
+
+```{r}
+#| label: convert-strings-to-factors
+
+#we transform predictors `category` and `job` are transformed into factors
+card_fraud <- card_fraud %>% 
+  mutate(category = factor(category),
+         job = factor(job))
+
+```
+
+`category` has 14 unique values, and `job` has 494 unique values. The dataset is quite large, with over 670K records, so these variables don't have an excessive number of levels at first glance. However, it is worth seeing if we can compact the levels to a smaller number.
+
+```{r}
+# select a smaller subset
+my_card_fraud <- card_fraud %>% 
+  # select a smaller subset, 10% of the entire dataframe 
+  select(category, amt, city_pop, is_fraud, hour, age, distance_km,wday) %>% 
+  slice_sample(prop = 0.10) 
+```
+
+
+## Split the data in training - testing
+
+```{r}
+# **Split the data**
+
+set.seed(123)
+
+data_split <- initial_split(my_card_fraud, # updated data
+                           prop = 0.8, 
+                           strata = is_fraud)
+
+card_fraud_train <- training(data_split) 
+card_fraud_test <- testing(data_split)
+```
+
+
+## Cross Validation
+
+Start with 3 CV folds to quickly get an estimate for the best model and you can increase the number of folds to 5 or 10 later.
+
+```{r}
+set.seed(123)
+cv_folds <- vfold_cv(data = card_fraud_train, 
+                          v = 3, 
+                          strata = is_fraud)
+cv_folds 
+```
+
+
+## Define a tidymodels `recipe`
+
+What steps are you going to add to your recipe? Do you need to do any log transformations?
+
+```{r, define_recipe}
+
+fraud_rec <- recipe(is_fraud ~ ., data = card_fraud_train) %>%
+  step_log(amt) %>%   #Log normalize the amount to improve the indicator
+  step_novel(all_nominal(), -all_outcomes()) %>% # Use *before* `step_dummy()` so new level is dummified
+  step_dummy(all_nominal(), -all_outcomes()) %>% #Adds a catch-all level to a factor for any new values not encountered in model training
+  step_zv(all_numeric(), -all_outcomes())  %>% #Intelligently handles zero variance variables
+  step_normalize(all_numeric()) #Centers then scales numeric variable
+```
+
+Once you have your recipe, you can check the pre-processed dataframe 
+
+```{r}
+prepped_data <- 
+  fraud_rec %>% # use the recipe object
+  prep() %>% # perform the recipe on training data
+  juice() # extract only the preprocessed dataframe 
+
+glimpse(prepped_data)
+```
+
+
+## Define various models
+
+You should define the following classification models:
+
+1. Logistic regression, using the `glm` engine
+2. Decision tree, using the `C5.0` engine
+3. Random Forest, using  the `ranger` engine and setting `importance = "impurity"`)  
+4. A boosted tree using Extreme Gradient Boosting, and the `xgboost` engine
+5. A k-nearest neighbours,  using 4 nearest_neighbors and the `kknn` engine  
+
+```{r, define_models}
+## Model Building 
+
+# 1. Pick a `model type`
+# 2. set the `engine`
+# 3. Set the `mode`:  classification
+
+# 1.Logistic regression
+log_spec <-  logistic_reg() %>%  # model type
+  set_engine(engine = "glm") %>%  # model engine
+  set_mode("classification") # model mode
+
+# 2.Decision Tree
+tree_spec <- decision_tree() %>%
+  set_engine(engine = "C5.0") %>%
+  set_mode("classification")
+
+# 3.Random Forest
+rf_spec <- 
+  rand_forest() %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+# 4.Boosted tree (XGBoost)
+xgb_spec <- 
+  boost_tree() %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification") 
+
+# 5.K-nearest neighbour (k-NN)
+knn_spec <- 
+  nearest_neighbor(neighbors = 4) %>% # we can adjust the number of neighbors 
+  set_engine("kknn") %>% 
+  set_mode("classification") 
+
+```
+
+## Bundle recipe and model with `workflows`
+
+```{r, define_workflows}
+## Bundle recipe and model with `workflows`
+
+# Logistic regression workflow
+log_wflow <- # new workflow object
+ workflow() %>% # use workflow function
+ add_recipe(fraud_rec) %>%   # use the new recipe
+ add_model(log_spec)   # add your model spec
+
+
+# Decision Tree workflow
+tree_wflow <-
+ workflow() %>%
+ add_recipe(fraud_rec) %>% 
+ add_model(tree_spec) 
+
+
+# Random Forest workflow
+rf_wflow <-
+ workflow() %>%
+ add_recipe(fraud_rec) %>% 
+ add_model(rf_spec) 
+
+
+# Boosted tree (XGBoost) workflow
+xgb_wflow <-
+ workflow() %>%
+ add_recipe(fraud_rec) %>% 
+ add_model(xgb_spec)
+
+
+# K-nearest neighbour workflow
+knn_wflow <-
+ workflow() %>%
+ add_recipe(fraud_rec) %>% 
+ add_model(knn_spec)
+
+```
+
+
+## Fit models
+
+You may want to compare the time it takes to fit each model. `tic()` starts a simple timer and `toc()` stops it
+
+```{r, fit_models}
+# Logistic regression 
+tic()
+log_res <- log_wflow %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+      recall, precision, f_meas, accuracy,
+      kap, roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE)) 
+time <- toc()
+log_time <- time[[4]]
+
+
+
+## Decision Tree results
+tic()
+tree_res <-
+  tree_wflow %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE)
+    ) 
+time <- toc()
+tree_time <- time[[4]]
+
+## Random Forest
+
+rf_res <-
+  rf_wflow %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE)
+    ) 
+time <- toc()
+forest_time <- time[[4]]
+
+## Boosted tree - XGBoost
+
+xgb_res <- 
+  xgb_wflow %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE)
+    ) 
+time <- toc()
+xgb_time <- time[[4]]
+
+## K-nearest neighbour
+tic()
+knn_res <- 
+  knn_wflow %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE)
+    ) 
+time <- toc()
+k_time <- time[[4]]
+
+print(paste0("Logistic regression time: ", log_time, " Decision Tree time: ", tree_time,
+             " Decision Tree time: ",forest_time, "Boosted tree - XGBoost time: ", xgb_time, 
+             " K-nearest neighbour: ",k_time))
+```
+
+## Compare models
+
+```{r, compare_models}
+## Model Comparison
+
+log_metrics <- 
+  log_res %>% 
+  collect_metrics(summarise = TRUE) %>%
+  # add the name of the model to every row
+  mutate(model = "Logistic Regression",
+         time = log_time)
+
+tree_metrics <- 
+  tree_res %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Decision Tree")
+
+rf_metrics <- 
+  rf_res %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Random Forest")
+
+xgb_metrics <- 
+  xgb_res %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "XGBoost")
+
+knn_metrics <- 
+  knn_res %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Knn")
+
+# create dataframe with all models
+model_compare <- bind_rows(log_metrics,
+                            tree_metrics,
+                            rf_metrics,
+                           xgb_metrics,
+                           knn_metrics
+                      ) %>% 
+  # get rid of 'sec elapsed' and turn it into a number
+  mutate(time = str_sub(time, end = -13) %>% 
+           as.double()
+         )
+
+#Pivot wider to create barplot
+  model_comp <- model_compare %>% 
+  select(model, .metric, mean, std_err) %>% 
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err)) 
+
+# show mean are under the curve (ROC-AUC) for every model
+model_comp %>% 
+  arrange(mean_roc_auc) %>% 
+  mutate(model = fct_reorder(model, mean_roc_auc)) %>% # order results
+  ggplot(aes(model, mean_roc_auc, fill=model)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_brewer(palette = "Blues") +
+   geom_text(
+     size = 3,
+     aes(label = round(mean_roc_auc, 2), 
+         y = mean_roc_auc + 0.08),
+     vjust = 1
+  )+
+  theme_light()+
+  theme(legend.position = "none")+
+  labs(y = NULL)
+
+```
+
+## Which metric to use
+
+This is a highly imbalanced data set, as roughly 99.5% of all transactions are ok, and it's only 0.5% of transactions that are fraudulent.
+
+## `last_fit()`
+```{r}
+
+## `last_fit()` on test set
+
+# - `last_fit()`  fits a model to the whole training data and evaluates it on the test set. 
+# - provide the workflow object of the best model as well as the data split object (not the training data). 
+ last_fit_xgb <- last_fit(xgb_wflow,  #changeegeeeeeeeeeeeeeeeeeeeeee
+                        split = data_split,
+                        metrics = metric_set(
+                          accuracy, f_meas, kap, precision,
+                          recall, roc_auc, sens, spec))
+
+last_fit_xgb %>% collect_metrics(summarize = TRUE)
+
+#Compare to training
+xgb_res %>% collect_metrics(summarize = TRUE)
+
+
+```
+
+
+
+## Get variable importance using `vip` package
+
+
+```{r}
+#variable importance
+last_fit_xgb %>% 
+  pluck(".workflow", 1) %>%   
+  pull_workflow_fit() %>% 
+  vip(num_features = 10) +
+  theme_light()
+```
+
+## Plot Final Confusion matrix and ROC curve
+
+
+```{r}
+## Final Confusion Matrix
+last_fit_xgb %>%
+  collect_predictions() %>% 
+  conf_mat(is_fraud, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+
+## Final ROC curve
+last_fit_xgb %>% 
+  collect_predictions() %>% 
+  roc_curve(is_fraud, .pred_1) %>% 
+  autoplot()
+```
+
+
+##  Calculating the cost of fraud to the company
+
+
+- How much money (in US\$ terms) are fraudulent transactions costing the company? Generate a table that summarizes the total amount of legitimate and fraudulent transactions per year and calculate the % of fraudulent transactions, in US\$ terms. Compare your model vs the naive classification that we do not have any fraudulent transactions. 
+
+```{r}
+#| label: savings-for-cc-company
+#table that summarizes the total amount of legitimate and fraudulent transactions
+card_fraud %>% 
+  group_by(year, is_fraud) %>% 
+  summarise('Amount' = sum(amt)) %>% 
+  ungroup %>% 
+  group_by(year) %>% 
+  mutate('Percent' = Amount / sum(Amount))
+  
+# Best model workflow workflow
+
+best_model_preds <- 
+  xgb_wflow %>% #best model workflow
+  fit(data = card_fraud_train) %>%  
+  ## Use `augment()` to get predictions for entire data set
+  augment(new_data = card_fraud)
+
+best_model_preds %>% 
+  conf_mat(truth = is_fraud, estimate = .pred_class)
+
+cost <- best_model_preds %>%
+  select(is_fraud, amt, pred = .pred_class) 
+
+cost <- cost %>%
+  mutate(
+
+  # naive false-- we think every single transaction is ok and not fraud
+  false_naives=ifelse(is_fraud==1, amt, 0),
+
+  # false negatives-- we thought they were not fraud, but they were
+
+  false_negatives=ifelse(pred==0 & is_fraud==1, amt, 0),
+  
+  # false positives-- we thought they were fraud, but they were not
+
+  false_positives=ifelse(pred==1 & is_fraud==0, amt, 0),
+    
+  # true positives-- we thought they were fraud, and they were 
+
+  true_positives=ifelse(pred==1 & is_fraud==1, amt, 0),
+  
+  # true negatives-- we thought they were ok, and they were 
+  true_negatives=ifelse(pred==0 & is_fraud==0, amt, 0),
+)
+
+improvement<-(cost$false_naives - cost$false_negatives - cost$false_positives * 0.02)
+
+scales::dollar(improvement)
+  
+# Summarising
+
+cost_summary <- cost %>% 
+  summarise(across(starts_with(c("false","true", "amt")), 
+            ~ sum(.x, na.rm = TRUE)))
+
+cost_summary
+
+```
+
+$2,075,089 are fraudulent transactions 
+
+The company gains $1,700,348 by using our model.
