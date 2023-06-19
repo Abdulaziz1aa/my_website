@@ -102,10 +102,10 @@ params:
         subtitle: Magazine
         title: Cogs and Caffeine
         url: https://www.aub.edu.lb/msfea/Pages/CogsandCaffeine.aspx/
-#      - image: pic06.jpg
-#        subtitle: Feugiat Amet Tempus
-#        title: Etiam
-#        url: blogs/ipsum
+      - image: CV.jpg
+        subtitle: 
+        title: CV
+        url: blogs/CV
 #  two:
 #    buttonText: Get Started
 #    enable: yes
